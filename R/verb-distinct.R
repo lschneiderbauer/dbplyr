@@ -17,8 +17,31 @@
 distinct.tbl_lazy <- function(.data, ..., .keep_all = FALSE) {
   grps <- syms(op_grps(.data))
   empty_dots <- dots_n(...) == 0
-  can_use_distinct <- !.keep_all || (empty_dots && is_empty(grps))
-  if (!can_use_distinct) {
+  can_use_distinct <-
+    !.keep_all ||
+    (empty_dots && is_empty(grps)) ||
+    supports_distinct_on(.data$src$con)
+
+  if (can_use_distinct) {
+    if (empty_dots) {
+      dots <- quos(!!!syms(colnames(.data)))
+    } else {
+      dots <- partial_eval_dots(.data, ..., .named = FALSE)
+      dots <- quos(!!!dots)
+    }
+    prep <- distinct_prepare_compat(.data, dots, group_vars = group_vars(.data))
+
+    if (!.keep_all) {
+      out <- dplyr::select(prep$data, prep$keep)
+      out$lazy_query <- add_distinct(out, distinct = TRUE)
+    } else {
+      out <- prep$data
+      out$lazy_query <- add_distinct(
+        out,
+        distinct = set_names(names(quos_auto_name(dots)))
+      )
+    }
+  } else {
     needs_dummy_order <- is.null(op_sort(.data))
 
     if (needs_dummy_order) {
@@ -26,40 +49,28 @@ distinct.tbl_lazy <- function(.data, ..., .keep_all = FALSE) {
       .data <- .data %>% window_order(!!sym(dummy_order_vars))
     }
 
-    .data <- .data %>%
+    out <- .data %>%
       group_by(..., .add = TRUE) %>%
       filter(row_number() == 1L) %>%
       group_by(!!!grps)
 
     if (needs_dummy_order) {
-      .data <- .data %>% window_order()
+      out <- out %>% window_order()
     }
-
-    return(.data)
   }
-
-  if (empty_dots) {
-    dots <- quos(!!!syms(colnames(.data)))
-  } else {
-    dots <- partial_eval_dots(.data, ..., .named = FALSE)
-    dots <- quos(!!!dots)
-  }
-  prep <- distinct_prepare_compat(.data, dots, group_vars = group_vars(.data))
-  out <- dplyr::select(prep$data, prep$keep)
-
-  out$lazy_query <- add_distinct(out)
   out
 }
 
 # copied from dplyr with minor changes (names -> colnames)
 # https://github.com/tidyverse/dplyr/blob/main/R/distinct.R
-distinct_prepare_compat <- function(.data,
-                             vars,
-                             group_vars = character(),
-                             .keep_all = FALSE,
-                             caller_env = caller_env(2),
-                             error_call = caller_env()
-                             ) {
+distinct_prepare_compat <- function(
+  .data,
+  vars,
+  group_vars = character(),
+  .keep_all = FALSE,
+  caller_env = caller_env(2),
+  error_call = caller_env()
+) {
   stopifnot(is_quosures(vars), is.character(group_vars))
 
   # If no input, keep all variables
@@ -82,7 +93,10 @@ distinct_prepare_compat <- function(.data,
   if (length(missing_vars) > 0) {
     bullets <- c(
       "Must use existing variables.",
-      set_names(glue("`{missing_vars}` not found in `.data`."), rep("x", length(missing_vars)))
+      set_names(
+        glue("`{missing_vars}` not found in `.data`."),
+        rep("x", length(missing_vars))
+      )
     )
     abort(bullets, call = error_call)
   }
@@ -103,9 +117,7 @@ distinct_prepare_compat <- function(.data,
 
 # copied from dplyr
 # https://github.com/tidyverse/dplyr/blob/main/R/group-by.R#L243
-add_computed_columns <- function(.data,
-                                 vars,
-                                 error_call = caller_env()) {
+add_computed_columns <- function(.data, vars, error_call = caller_env()) {
   is_symbol <- purrr::map_lgl(vars, quo_is_variable_reference)
   needs_mutate <- have_name(vars) | !is_symbol
 
@@ -146,12 +158,16 @@ quo_is_variable_reference <- function(quo) {
 }
 
 
-add_distinct <- function(.data) {
+add_distinct <- function(.data, distinct) {
   lazy_query <- .data$lazy_query
+
+  if (!is_bool(distinct)) {
+    distinct <- syms(distinct)
+  }
 
   out <- lazy_select_query(
     x = lazy_query,
-    distinct = TRUE
+    distinct = distinct
   )
   # TODO this could also work for joins
   if (!is_lazy_select_query(lazy_query)) {
@@ -171,6 +187,7 @@ add_distinct <- function(.data) {
     return(out)
   }
 
-  lazy_query$distinct <- TRUE
+  lazy_query$distinct <- distinct
+
   lazy_query
 }
